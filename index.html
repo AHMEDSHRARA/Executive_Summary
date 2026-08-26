@@ -1267,6 +1267,7 @@ $('#importFile').onchange=e=>{
       return o;}).filter(o=>o.name);
     if(!out.length){alert('No recognizable contract rows found. Please check the column headers match the template.');return;}
     DATA=out; FILTERS.forEach(f=>sel[f.key].clear()); buildFilterUI(); setDataDate(); apply();
+    if(window.cloudStampAll)window.cloudStampAll('Excel import ('+DATA.length+' contracts)');
   };
   rd.readAsArrayBuffer(file); e.target.value='';
 };
@@ -3061,8 +3062,12 @@ openSyncModal=function(){
 
   /* ---- config (per-device settings; the DATA they point to is shared) ---- */
   const cfg=()=>({ provider:g('cloud_provider')||'', bin:g('cloud_bin')||'', key:g('cloud_key')||'',
-    poll:Math.max(5,+(g('cloud_poll')||15)), auto:g('cloud_auto')!=='0', user:g('wx_user')||'' });
+    poll:Math.max(5,+(g('cloud_poll')||10)), auto:g('cloud_auto')!=='0', user:g('wx_user')||'' });
   function configured(){ const c=cfg(); return c.provider==='jsonbin'? !!c.bin : (c.provider==='rest'? !!c.bin : false); }
+  /* stable per-device user identity (prototype; swap for real auth later) */
+  function userId(){ let u=g('cloud_user_id'); if(!u){ u='u-'+Math.random().toString(36).slice(2,9); s('cloud_user_id',u);} return u; }
+  function currentUser(){ return { id:userId(), name:(cfg().user||'Anonymous') }; }
+  let lastSyncAt='';
 
   /* ---- local audit + per-contract change stamps (persisted, also shared) ---- */
   let AUDIT=[]; let DATA_META={}; let dirtyIds=new Set();
@@ -3090,21 +3095,61 @@ openSyncModal=function(){
         async put(doc){ const r=await F(base,{method:'PUT',headers:H,body:JSON.stringify(doc)}); if(!r.ok)throw new Error('PUT '+r.status); return true; }
       };
     }
-    /* generic REST / custom backend: GET url -> doc ; PUT url <- doc (Bearer key) */
+    /* generic REST / custom backend: GET url -> doc ; PUT url <- doc (Bearer key + CAS) */
     const url=c.bin.replace(/\/+$/,''); const H={'Content-Type':'application/json'}; if(c.key)H.Authorization='Bearer '+c.key;
     return {
       async get(){ const r=await F(url,{headers:H}); if(!r.ok)throw new Error('GET '+r.status); const j=await r.json(); return j&&j.record?j.record:j; },
-      async put(doc){ let r=await F(url,{method:'PUT',headers:H,body:JSON.stringify(doc)});
-        if(r.status===405||r.status===404){ r=await F(url,{method:'POST',headers:H,body:JSON.stringify(doc)}); }
+      async put(doc){ /* compare-and-swap: server rejects if its revision moved past ours */
+        const H2=Object.assign({'If-Match':String((doc.rev||1)-1),'X-Expected-Revision':String((doc.rev||1)-1)},H);
+        let r=await F(url,{method:'PUT',headers:H2,body:JSON.stringify(doc)});
+        if(r.status===409||r.status===412){ const e=new Error('conflict'); e.conflict=true; throw e; }
+        if(r.status===405||r.status===404){ r=await F(url,{method:'POST',headers:H2,body:JSON.stringify(doc)});
+          if(r.status===409||r.status===412){ const e=new Error('conflict'); e.conflict=true; throw e; } }
         if(!r.ok)throw new Error('PUT '+r.status); return true; }
     };
   }
 
   /* ---- shared document assembly ---- */
   let REV=+(g('cloud_rev')||0), appliedRev=REV, baseRev=REV, pushing=false, pending=false, pollTimer=null;
+  let UIBYUSER={};                                  // { userId: {ui snapshot, at, name} } — per-user, cloud-backed
+  try{ UIBYUSER=JSON.parse(g('cloud_uibyuser')||'{}'); }catch(e){ UIBYUSER={}; }
+  /* capture THIS user's current HTML view (tab/project/week/filters/etc.) */
+  function uiSnapshot(){
+    const active=document.querySelector('.navBtn.active');
+    let scrollY=0; try{ const sc=document.querySelector('.scrollArea')||document.scrollingElement; scrollY=sc?sc.scrollTop:0; }catch(e){}
+    return { activeTab:active?active.dataset.page:'pg1',
+      selectedProject:W5.project, selectedContract:W5.ck, selectedWeek:W5.week, w5program:W5.program,
+      filters:Object.fromEntries(FILTERS.map(f=>[f.key,[...sel[f.key]]])), dateFrom, dateTo,
+      searchText:(typeof detQuery!=='undefined'?detQuery:''), sortOrder:(typeof detSort!=='undefined'?detSort:null),
+      theme:document.documentElement.dataset.theme||'dark', scrollY, lastUpdatedAt:now() };
+  }
+  /* apply a UI snapshot (UI only — never touches business data) */
+  function applyUI(u){
+    if(!u)return false;
+    try{
+      if(u.theme){ document.documentElement.dataset.theme=u.theme; const tl=document.getElementById('themeLbl'); if(tl)tl.textContent=u.theme==='dark'?'Light':'Dark'; }
+      if(u.filters)FILTERS.forEach(f=>{ sel[f.key]=new Set(u.filters[f.key]||[]); });
+      dateFrom=u.dateFrom||null; dateTo=u.dateTo||null;
+      const df=document.getElementById('dateFrom'), dt=document.getElementById('dateTo'); if(df)df.value=dateFrom||''; if(dt)dt.value=dateTo||'';
+      W5.project=u.selectedProject||W5.project; W5.ck=u.selectedContract||W5.ck; W5.week=u.selectedWeek||W5.week; W5.program=u.w5program||W5.program;
+      if(typeof u.searchText==='string'&&typeof detQuery!=='undefined')detQuery=u.searchText;
+      if(u.sortOrder&&typeof detSort!=='undefined')detSort=u.sortOrder;
+      buildFilterUI(); if(typeof refreshFilters==='function')refreshFilters();
+      const pid=u.activeTab||'pg1', btn=document.querySelector('.navBtn[data-page="'+pid+'"]');
+      if(btn){ document.querySelectorAll('.navBtn').forEach(x=>x.classList.remove('active')); btn.classList.add('active');
+        document.querySelectorAll('.page').forEach(p=>p.classList.remove('active')); const pg=document.getElementById(pid); if(pg)pg.classList.add('active');
+        if(TITLES[pid]){ document.getElementById('pageTitle').textContent=TITLES[pid][0]; document.getElementById('pageSub').textContent=TITLES[pid][1]; } }
+      setDataDate&&setDataDate(); apply();
+      if((u.activeTab==='pg5')&&typeof renderPage5==='function'){ try{ renderPage5(); }catch(e){} }
+      if(u.scrollY){ try{ const sc=document.querySelector('.scrollArea')||document.scrollingElement; if(sc)sc.scrollTop=u.scrollY; }catch(e){} }
+      return true;
+    }catch(e){ return false; }
+  }
   function buildDoc(rev){
-    return { sig:SIG, rev, updatedAt:now(), updatedBy:(cfg().user||'Anonymous'),
-      data:DATA, dataMeta:DATA_META, wx:WX,
+    UIBYUSER[userId()]=Object.assign(uiSnapshot(),{name:currentUser().name});
+    try{ s('cloud_uibyuser',JSON.stringify(UIBYUSER)); }catch(e){}
+    return { sig:SIG, schemaVersion:1, rev, updatedAt:now(), updatedBy:currentUser().name, updatedById:userId(),
+      data:DATA, dataMeta:DATA_META, wx:WX, uiByUser:UIBYUSER,
       importMeta:{ at:g('wx_last_import_at')||'', by:g('wx_last_import_by')||'', rows:(DATA||[]).length },
       audit:AUDIT.slice(-500) };
   }
@@ -3130,20 +3175,28 @@ openSyncModal=function(){
     if(typeof mergeWX==='function')mergeWX(remote.wx||{});
     /* audit: union + cap */
     AUDIT=unionBy(AUDIT.concat(remote.audit||[]),a=>a.id||JSON.stringify(a)).slice(-500);
+    /* per-user UI: keep the newest snapshot for each user (never clobber someone else's view) */
+    const rui=remote.uiByUser||{};
+    for(const uid in rui){ if(!UIBYUSER[uid]||String(rui[uid].lastUpdatedAt||'')>String(UIBYUSER[uid].lastUpdatedAt||''))UIBYUSER[uid]=rui[uid]; }
+    try{ s('cloud_uibyuser',JSON.stringify(UIBYUSER)); }catch(e){}
     saveSide();
     return true;
   }
 
+  /* restore THIS user's last view from the cloud (used on boot / iframe recreation) */
+  function restoreMyUI(){ const mine=UIBYUSER[userId()]; if(mine){ return applyUI(mine); } return false; }
+
   /* ---- pull ---- */
   async function pull(silent){
     if(!configured())return {ok:false,reason:'not configured'};
+    setStatus('syncing');
     try{ const remote=await provider().get();
       if(remote&&remote.sig===SIG){
         if((+remote.rev||0)>appliedRev){ mergeIn(remote); appliedRev=+remote.rev||0; baseRev=Math.max(baseRev,appliedRev); REV=Math.max(REV,appliedRev);
           s('cloud_rev',String(REV)); rerender(); if(!silent)wxToast&&wxToast('Pulled latest ✓'); else wxToast&&wxToast('Synced from cloud'); }
-        setStatus('live'); return {ok:true,changed:true,rev:appliedRev};
+        lastSyncAt=now(); setStatus('live'); return {ok:true,changed:true,rev:appliedRev};
       }
-      setStatus('live'); return {ok:true,changed:false};
+      lastSyncAt=now(); setStatus('live'); return {ok:true,changed:false};
     }catch(e){ setStatus('offline'); return {ok:false,reason:String(e.message||e)}; }
   }
 
@@ -3151,28 +3204,32 @@ openSyncModal=function(){
   function dirtySatisfied(doc){ const dm=(doc&&doc.dataMeta)||{}; for(const id of dirtyIds){ const local=DATA_META[id]; if(!local)continue;
     if(!dm[id]||dm[id].at!==local.at||dm[id].by!==local.by)return false; } return true; }
 
-  /* ---- push (read-merge-write + verify-after-write; no silent lost update) ---- */
+  /* ---- push (read-merge-write + verify-after-write + REST compare-and-swap) ---- */
   async function push(reason){
     if(!configured()){ return {ok:false,reason:'not configured'}; }
     if(pushing){ pending=true; return {ok:false,reason:'busy'}; }
-    pushing=true;
+    pushing=true; setStatus('syncing');
     try{
       let attempts=0;
       while(true){
         let remote=null; try{ remote=await provider().get(); }catch(e){ remote=null; }
         if(remote&&remote.sig===SIG&&(+remote.rev||0)>baseRev){ mergeIn(remote); baseRev=+remote.rev||0; appliedRev=Math.max(appliedRev,baseRev); }
         REV=Math.max(REV,baseRev)+1;
-        await provider().put(buildDoc(REV));
-        /* verify our write actually landed and wasn't overwritten by a concurrent writer */
+        try{ await provider().put(buildDoc(REV)); }
+        catch(err){ if(err&&err.conflict&&attempts<5){ setStatus('conflict');   // server-enforced CAS rejected us
+            let cur=null; try{ cur=await provider().get(); }catch(e){}
+            if(cur&&cur.sig===SIG){ mergeIn(cur); baseRev=+cur.rev||baseRev; appliedRev=Math.max(appliedRev,baseRev); }
+            attempts++; continue; }
+          throw err; }
+        /* verify our write landed and wasn't overwritten by a concurrent writer */
         let check=null; try{ check=await provider().get(); }catch(e){ check=null; }
         const landed = check && check.sig===SIG && (+check.rev||0)>=REV && dirtySatisfied(check);
-        if(landed || attempts>=4){
+        if(landed || attempts>=5){
           baseRev=+((check&&check.rev)||REV); appliedRev=baseRev; REV=Math.max(REV,baseRev); s('cloud_rev',String(REV));
-          if(landed){ dirtyIds.clear(); pending=false; setStatus('live'); }
+          if(landed){ dirtyIds.clear(); pending=false; lastSyncAt=now(); setStatus('live'); }
           else { pending=true; setStatus('pending'); queueRetry(); }
-          pushing=false; return {ok:landed,rev:REV,reason:landed?'':'clobbered — will retry'};
+          pushing=false; return {ok:landed,rev:REV,reason:landed?'':'conflict — will retry'};
         }
-        /* clobbered: fold in the winner's doc (keeps our still-dirty overlay) and push again */
         if(check&&check.sig===SIG){ mergeIn(check); baseRev=+check.rev||baseRev; appliedRev=Math.max(appliedRev,baseRev); }
         attempts++;
       }
@@ -3180,6 +3237,10 @@ openSyncModal=function(){
   }
   let pushTimer=null;
   function schedulePush(reason){ if(!configured()||!cfg().auto)return; clearTimeout(pushTimer); pushTimer=setTimeout(()=>push(reason||'auto'),1200); }
+  /* UI-state changes (tab/project/filters) are pushed to THIS user's cloud slot, debounced longer */
+  let uiTimer=null;
+  function scheduleUiPush(){ if(!configured()||!cfg().auto)return; clearTimeout(uiTimer); uiTimer=setTimeout(()=>{ if(!pushing)push('ui'); },3500); }
+  window.cloudScheduleUiPush=scheduleUiPush;
   let retryN=0, retryTimer=null;
   function queueRetry(){ clearTimeout(retryTimer); const wait=Math.min(30000,1000*Math.pow(2,retryN++)); retryTimer=setTimeout(()=>{ push('retry').then(r=>{ if(r&&r.ok)retryN=0; }); },wait); }
   window.addEventListener&&window.addEventListener('online',()=>{ if(pending)push('online'); });
@@ -3197,12 +3258,19 @@ openSyncModal=function(){
   function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
 
   /* ---- status chip (reuses the header State dot) ---- */
-  function setStatus(mode){ const dot=document.getElementById('stateDot'), lbl=document.getElementById('stateLbl');
+  let STATUS='idle';
+  function setStatus(mode){ STATUS=mode; const dot=document.getElementById('stateDot'), lbl=document.getElementById('stateLbl');
+    updateModalStatus();
     if(!dot||!lbl)return;
-    if(mode==='live'){ dot.style.background='#1E9E6A'; lbl.textContent='Cloud · r'+REV; }
-    else if(mode==='pending'){ dot.style.background='#D89A2B'; lbl.textContent='Pending…'; }
+    if(mode==='live'){ dot.style.background='#1E9E6A'; lbl.textContent='Synced · r'+REV; }
+    else if(mode==='syncing'){ dot.style.background='#2D6FB3'; lbl.textContent='Syncing…'; }
+    else if(mode==='pending'){ dot.style.background='#D89A2B'; lbl.textContent='Changes pending'; }
+    else if(mode==='conflict'){ dot.style.background='#D89A2B'; lbl.textContent='Resolving conflict…'; }
     else if(mode==='offline'){ dot.style.background='#E0356E'; lbl.textContent='Offline · r'+REV; }
   }
+  function statusLabel(){ return {live:'● Synced',syncing:'● Syncing…',pending:'● Changes pending',conflict:'● Conflict — resolving',offline:'● Offline',idle:'○ Not connected'}[STATUS]||STATUS; }
+  function updateModalStatus(){ const box=document.getElementById('clLive'); if(!box)return;
+    box.innerHTML=`Status: <b>${statusLabel()}</b> &nbsp;·&nbsp; Current revision: <b>${REV}</b> &nbsp;·&nbsp; Last sync: <b>${lastSyncAt?lastSyncAt.replace('T',' ').slice(11,19):'—'}</b> &nbsp;·&nbsp; Pending: <b>${pending?dirtyIds.size||'yes':0}</b> &nbsp;·&nbsp; You: <b>${currentUser().name}</b>`; }
 
   /* ---- settings modal ---- */
   function openCloudModal(){
@@ -3230,22 +3298,29 @@ openSyncModal=function(){
         <input type="checkbox" id="clAuto" ${c.auto?'checked':''}> Auto: pull on open + poll, push after every change</label>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <button class="ebtn save" id="clSave">Save & connect</button>
+        <button class="wkbtn" id="clTest">Test connection</button>
         <button class="wkbtn" id="clCreate">Create new JSONBin</button>
-        <button class="wkbtn" id="clPull">⭳ Pull now</button>
+        <button class="wkbtn" id="clPull">⭳ Sync now (pull)</button>
         <button class="wkbtn" id="clPush">⭱ Push now</button>
         <span id="clStat" class="syncPill">${configured()?'configured':'off'}</span>
       </div>
+      <div id="clLive" style="margin-top:10px;font-size:11.5px;color:var(--ink2);background:var(--surface2);border-radius:8px;padding:8px 11px"></div>
       <div class="syncNote"><b>2-minute setup:</b> sign up free at <code>jsonbin.io</code>, open <b>API Keys</b> and copy your <b>X-Master-Key</b>,
-        paste it above, then click <b>Create new JSONBin</b> (or paste an existing Bin ID). Share the same Bin ID + key with all 15+ users.<br>
-        <b>Power BI:</b> the workspace iframe blocks browser storage, so this cloud doc is what makes data survive refresh/reopen and appear for everyone.<br>
-        <b>Conflicts:</b> different records edited at once all survive (record-level merge); comments &amp; history are never lost; the same record edited at the same instant keeps the newest by timestamp. <b>Audit</b> records who changed what.</div>
+        paste it above, then click <b>Create new JSONBin</b> (or paste an existing Bin ID). Share the same Bin ID + key with all users.<br>
+        <b>Security:</b> a JSONBin Master Key in a public GitHub Pages file is fine for a prototype but is <i>visible to anyone</i>. For production, switch Provider to <b>Custom REST</b> pointing at your own API (auth + database + server-enforced compare-and-swap) — no dashboard rewrite needed.<br>
+        <b>Power BI:</b> the workspace iframe blocks browser storage, so this cloud doc is what makes data (and your last view) survive refresh, iframe recreation and reopen.<br>
+        <b>Conflicts:</b> different records edited at once all survive; comments &amp; history are never lost; same-record simultaneous edits keep newest by <code>updated_at</code> (JSONBin) or are rejected+retried via compare-and-swap (Custom REST).</div>
       <div id="clAudit" style="margin-top:10px"></div>`;
     const q=id=>document.getElementById(id);
     const readForm=()=>{ s('cloud_provider',q('clProv').value); s('cloud_bin',q('clBin').value.trim());
-      s('cloud_key',q('clKey').value.trim()); s('wx_user',q('clUser').value.trim()); s('cloud_poll',String(+q('clPoll').value||15));
+      s('cloud_key',q('clKey').value.trim()); s('wx_user',q('clUser').value.trim()); s('cloud_poll',String(+q('clPoll').value||10));
       s('cloud_auto',q('clAuto').checked?'1':'0'); };
     q('clSave').onclick=async()=>{ readForm(); q('clStat').textContent=configured()?'connecting…':'off';
-      if(configured()){ await pull(false); startPoll(); q('clStat').textContent='live · r'+REV; renderAudit(); } };
+      if(configured()){ await pull(false); restoreMyUI(); startPoll(); q('clStat').textContent='live · r'+REV; renderAudit(); } updateModalStatus(); };
+    q('clTest').onclick=async()=>{ readForm(); if(!configured()){ q('clStat').textContent='set provider + bin first'; return; }
+      q('clStat').textContent='testing…'; try{ const d=await provider().get();
+        q('clStat').textContent=(d&&d.sig===SIG)?('OK — found rev '+(d.rev||0)):'reachable, but empty/new bin'; }
+      catch(e){ q('clStat').textContent='FAILED: '+e.message; } };
     q('clCreate').onclick=async()=>{ readForm(); const key=q('clKey').value.trim();
       if(!key){ alert('Enter your JSONBin X-Master-Key first.'); return; }
       try{ const r=await F('https://api.jsonbin.io/v3/b',{method:'POST',
@@ -3256,15 +3331,15 @@ openSyncModal=function(){
           baseRev=appliedRev=REV=1; s('cloud_rev','1'); q('clStat').textContent='created · '+id; startPoll(); wxToast&&wxToast('Cloud bin created ✓'); }
         else alert('Bin created but no id returned — check the key/response.');
       }catch(e){ alert('Create failed: '+e.message+'\n(If this runs inside Power BI, the request still uses your browser — the key must be a valid JSONBin Master Key.)'); }
-    };
-    q('clPull').onclick=async()=>{ readForm(); const r=await pull(false); q('clStat').textContent=r.ok?('live · r'+REV):('error: '+r.reason); renderAudit(); };
-    q('clPush').onclick=async()=>{ readForm(); const r=await push('manual'); q('clStat').textContent=r.ok?('pushed · r'+REV):('error: '+r.reason); renderAudit(); };
+      updateModalStatus(); };
+    q('clPull').onclick=async()=>{ readForm(); const r=await pull(false); if(r.ok)restoreMyUI(); q('clStat').textContent=r.ok?('live · r'+REV):('error: '+r.reason); renderAudit(); updateModalStatus(); };
+    q('clPush').onclick=async()=>{ readForm(); const r=await push('manual'); q('clStat').textContent=r.ok?('pushed · r'+REV):('error: '+r.reason); renderAudit(); updateModalStatus(); };
     function renderAudit(){ const box=q('clAudit'); if(!box)return;
       const rows=AUDIT.slice(-8).reverse();
       box.innerHTML=`<div class="subhead">Recent audit trail</div>`+ (rows.length? `<div style="font-size:11px;color:var(--ink2);max-height:120px;overflow:auto">`+
         rows.map(a=>`<div style="padding:3px 0;border-bottom:1px solid var(--line)"><b>${a.by}</b> · ${a.at} · ${a.action}${a.detail?' — '+a.detail:''} <span style="color:var(--ink3)">r${a.rev}</span></div>`).join('')+`</div>` : '<div style="color:var(--ink3);font-size:11px">No entries yet.</div>');
     }
-    renderAudit();
+    renderAudit(); updateModalStatus();
     document.getElementById('modal').classList.add('open');
   }
   window.openCloudModal=openCloudModal;
@@ -3277,17 +3352,24 @@ openSyncModal=function(){
     menu.addEventListener('click',e=>{ const b=e.target.closest('button[data-s="cloud"]'); if(b){ e.stopPropagation(); menu.classList.remove('open'); openCloudModal(); } });
   })();
 
-  /* ---- hook business-data changes to a push (UI-state changes are NOT pushed) ---- */
+  /* ---- hook business-data changes to a shared push ---- */
   function wrap(name){ const f=window[name]; if(typeof f!=='function')return; window[name]=function(){ const r=f.apply(this,arguments); try{ schedulePush(name); }catch(e){} return r; }; }
-  ['wxSaveLocal'].forEach(wrap);   // weekly saves -> shared push (apply()/filters are UI-only, not pushed)
+  ['wxSaveLocal'].forEach(wrap);   // weekly saves -> shared push
+  /* hook UI changes -> push THIS user's view slot (debounced, so last view survives iframe recreation) */
+  document.addEventListener('click',e=>{ if(e.target.closest('.navBtn,.fsel,#clearAll,.w5sel,#themeBtn,.hchip'))scheduleUiPush(); },true);
+  document.addEventListener('change',e=>{ if(e.target.closest('#dateFrom,#dateTo,.w5sel,select,input'))scheduleUiPush(); },true);
+  document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden'&&pending&&configured())push('hide'); });
 
-  /* ---- expose for tests ---- */
-  window.CloudSync={ pull, push, mergeIn, buildDoc, cfg, configured, startPoll, stopPoll,
-    addAudit, stampAll:()=>window.cloudStampAll(), status:()=>({rev:REV,appliedRev,baseRev,pending,audit:AUDIT.length,dirty:[...dirtyIds]}),
+  /* ---- expose (tests + spec-named aliases) ---- */
+  window.CloudSync={ pull, push, mergeIn, buildDoc, cfg, configured, startPoll, stopPoll, restoreMyUI, applyUI, uiSnapshot, currentUser,
+    addAudit, stampAll:()=>window.cloudStampAll(), status:()=>({rev:REV,appliedRev,baseRev,pending,status:STATUS,lastSyncAt,audit:AUDIT.length,dirty:[...dirtyIds],uiUsers:Object.keys(UIBYUSER).length}),
     _setRev:v=>{REV=baseRev=appliedRev=v;} };
+  /* spec-named modular API */
+  window.loadCloudState=()=>pull(false); window.saveCloudState=()=>push('manual');
+  window.mergeStates=mergeIn; window.restoreDashboardState=restoreMyUI; window.startPolling=startPoll; window.flushOfflineQueue=()=>{ if(pending)return push('flush'); };
 
-  /* ---- boot: if configured, pull shared state then start polling ---- */
-  if(configured()){ pull(true).then(()=>startPoll()); }
+  /* ---- boot: config -> pull shared state -> restore THIS user's view -> render -> poll ---- */
+  if(configured()){ pull(true).then(()=>{ restoreMyUI(); startPoll(); }); }
 })();
 </script>
 
