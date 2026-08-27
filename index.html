@@ -3063,7 +3063,7 @@ openSyncModal=function(){
   /* ---- config (per-device settings; the DATA they point to is shared) ---- */
   const cfg=()=>({ provider:g('cloud_provider')||'', bin:g('cloud_bin')||'', key:g('cloud_key')||'',
     poll:Math.max(5,+(g('cloud_poll')||10)), auto:g('cloud_auto')!=='0', user:g('wx_user')||'' });
-  function configured(){ const c=cfg(); return c.provider==='jsonbin'? !!c.bin : (c.provider==='rest'? !!c.bin : false); }
+  function configured(){ const c=cfg(); return c.provider==='supabase'? !!c.bin&&!!c.key : c.provider==='jsonbin'? !!c.bin : (c.provider==='rest'? !!c.bin : false); }
   /* stable per-device user identity (prototype; swap for real auth later) */
   function userId(){ let u=g('cloud_user_id'); if(!u){ u='u-'+Math.random().toString(36).slice(2,9); s('cloud_user_id',u);} return u; }
   function currentUser(){ return { id:userId(), name:(cfg().user||'Anonymous') }; }
@@ -3084,10 +3084,61 @@ openSyncModal=function(){
 
   /* ---- provider adapters (fetch-based; jsonbin native + generic REST) ---- */
   const F=(...a)=> (window.fetch? window.fetch(...a) : Promise.reject(new Error('no fetch')));
+
+  /* ---- wire compression: gzip+base64 so the shared doc fits JSONBin's free 100KB cap ----
+     stored form = { sig, rev, updatedAt, updatedBy, enc:'gz', gz:'<base64>' }
+     rev/sig stay in clear so a poll can read the revision without inflating.        */
+  const CAN_GZ = (typeof CompressionStream!=='undefined' && typeof Response!=='undefined' && typeof Blob!=='undefined');
+  function b64FromBuf(buf){ const bytes=new Uint8Array(buf); let s=''; const C=0x8000;
+    for(let i=0;i<bytes.length;i+=C)s+=String.fromCharCode.apply(null,bytes.subarray(i,i+C)); return btoa(s); }
+  function bufFromB64(b64){ const bin=atob(b64), n=bin.length, a=new Uint8Array(n); for(let i=0;i<n;i++)a[i]=bin.charCodeAt(i); return a.buffer; }
+  async function gzipStr(str){ const cs=new CompressionStream('gzip');
+    const ab=await new Response(new Blob([str]).stream().pipeThrough(cs)).arrayBuffer(); return b64FromBuf(ab); }
+  async function gunzipStr(b64){ const ds=new DecompressionStream('gzip');
+    return await new Response(new Blob([bufFromB64(b64)]).stream().pipeThrough(ds)).text(); }
+  async function encodeWire(doc){
+    if(!CAN_GZ)return doc;                                  // fallback: store as-is (only fits if small)
+    try{ return { sig:doc.sig, rev:doc.rev, updatedAt:doc.updatedAt, updatedBy:doc.updatedBy, schemaVersion:doc.schemaVersion||1,
+      enc:'gz', gz:await gzipStr(JSON.stringify(doc)) }; }
+    catch(e){ return doc; }
+  }
+  async function decodeWire(wire){
+    if(wire&&wire.enc==='gz'&&wire.gz){ try{ return JSON.parse(await gunzipStr(wire.gz)); }catch(e){ return wire; } }
+    return wire;                                            // plain / legacy doc
+  }
+  async function readRemote(){ const raw=await provider().get(); return await decodeWire(raw); }
+  async function writeRemote(doc){ return await provider().put(await encodeWire(doc)); }
+
   function provider(){
     const c=cfg();
+    /* ---- Supabase (PostgreSQL via PostgREST + Realtime) ---- */
+    if(c.provider==='supabase'){
+      const url=c.bin.replace(/\/+$/,'');          // e.g. https://xxxx.supabase.co
+      const H={'Content-Type':'application/json','apikey':c.key,'Authorization':'Bearer '+c.key,'Prefer':'return=minimal'};
+      const TBL=url+'/rest/v1/dashboard_state';
+      return {
+        /* GET: read the single state row (id=1) */
+        async get(){
+          const r=await F(TBL+'?id=eq.1&select=payload',{headers:H});
+          if(!r.ok){ if(r.status===404||r.status===406)return null; throw new Error('GET '+r.status); }
+          const rows=await r.json();
+          if(!rows||!rows.length)return null;
+          const p=rows[0].payload;
+          return typeof p==='string'?JSON.parse(p):p;
+        },
+        /* PUT: upsert the single state row */
+        async put(doc){
+          const body=JSON.stringify([{id:1, payload:JSON.stringify(doc), updated_at:new Date().toISOString()}]);
+          const H2=Object.assign({'Prefer':'resolution=merge-duplicates,return=minimal'},H);
+          const r=await F(TBL,{method:'POST',headers:H2,body});
+          if(!r.ok){ const t=await r.text().catch(()=>''); throw new Error('PUT '+r.status+' '+t.slice(0,80)); }
+          return true;
+        }
+      };
+    }
+    /* ---- JSONBin ---- */
     if(c.provider==='jsonbin'){
-      const id=c.bin.replace(/^.*\/b\//,'').replace(/\/.*$/,'');   // accept full URL or bare id
+      const id=c.bin.replace(/^.*\/b\//,'').replace(/\/.*$/,'');
       const base='https://api.jsonbin.io/v3/b/'+id;
       const H={'Content-Type':'application/json','X-Master-Key':c.key,'X-Bin-Meta':'false'};
       return {
@@ -3095,11 +3146,11 @@ openSyncModal=function(){
         async put(doc){ const r=await F(base,{method:'PUT',headers:H,body:JSON.stringify(doc)}); if(!r.ok)throw new Error('PUT '+r.status); return true; }
       };
     }
-    /* generic REST / custom backend: GET url -> doc ; PUT url <- doc (Bearer key + CAS) */
+    /* ---- generic REST / custom backend: GET url -> doc ; PUT url <- doc (Bearer key + CAS) ---- */
     const url=c.bin.replace(/\/+$/,''); const H={'Content-Type':'application/json'}; if(c.key)H.Authorization='Bearer '+c.key;
     return {
       async get(){ const r=await F(url,{headers:H}); if(!r.ok)throw new Error('GET '+r.status); const j=await r.json(); return j&&j.record?j.record:j; },
-      async put(doc){ /* compare-and-swap: server rejects if its revision moved past ours */
+      async put(doc){
         const H2=Object.assign({'If-Match':String((doc.rev||1)-1),'X-Expected-Revision':String((doc.rev||1)-1)},H);
         let r=await F(url,{method:'PUT',headers:H2,body:JSON.stringify(doc)});
         if(r.status===409||r.status===412){ const e=new Error('conflict'); e.conflict=true; throw e; }
@@ -3108,6 +3159,40 @@ openSyncModal=function(){
         if(!r.ok)throw new Error('PUT '+r.status); return true; }
     };
   }
+
+  /* ---- Supabase Realtime (replaces polling when connected) ----
+     Opens a WebSocket to the Supabase Realtime channel. When any user
+     UPSERTs the state row, all other connected browsers receive the change
+     within ~1 second — no polling needed. Falls back to polling if WS fails. */
+  let rtSocket=null;
+  function startRealtime(){
+    const c=cfg(); if(c.provider!=='supabase'||!c.bin||!c.key)return;
+    stopRealtime();
+    try{
+      /* Supabase Realtime WebSocket endpoint */
+      const wsUrl=(c.bin.replace('https://','wss://').replace('http://','ws://').replace(/\/+$/,''))
+        +'/realtime/v1/websocket?apikey='+encodeURIComponent(c.key)+'&vsn=1.0.0';
+      const ws=new WebSocket(wsUrl); rtSocket=ws;
+      ws.onopen=()=>{ /* join postgres_changes channel */
+        ws.send(JSON.stringify({topic:'realtime:dashboard_state',event:'phx_join',
+          payload:{config:{broadcast:{self:false},postgres_changes:[{event:'UPDATE',schema:'public',table:'dashboard_state'}]}},ref:'1'}));
+      };
+      ws.onmessage=e=>{ try{ const m=JSON.parse(e.data);
+        if(m.event==='postgres_changes'||m.payload&&m.payload.event==='UPDATE'){
+          /* remote update: pull & merge without disturbing our view */
+          pull(true);
+        }
+      }catch(err){} };
+      ws.onerror=()=>{ rtSocket=null; /* fall back to poll */ startPoll(); };
+      ws.onclose=()=>{ rtSocket=null; setTimeout(startRealtime, 5000); };   // reconnect
+      /* heartbeat every 25s to keep the WS alive */
+      const hb=setInterval(()=>{ if(ws.readyState===1)ws.send(JSON.stringify({topic:'phoenix',event:'heartbeat',payload:{},ref:'hb'}));
+        else clearInterval(hb); }, 25000);
+      /* if realtime is running, stop polling to save requests */
+      stopPoll();
+    }catch(e){ startPoll(); }
+  }
+  function stopRealtime(){ if(rtSocket){ try{rtSocket.close();}catch(e){} rtSocket=null; } }
 
   /* ---- shared document assembly ---- */
   let REV=+(g('cloud_rev')||0), appliedRev=REV, baseRev=REV, pushing=false, pending=false, pollTimer=null;
@@ -3190,7 +3275,7 @@ openSyncModal=function(){
   async function pull(silent){
     if(!configured())return {ok:false,reason:'not configured'};
     setStatus('syncing');
-    try{ const remote=await provider().get();
+    try{ const remote=await readRemote();
       if(remote&&remote.sig===SIG){
         if((+remote.rev||0)>appliedRev){ mergeIn(remote); appliedRev=+remote.rev||0; baseRev=Math.max(baseRev,appliedRev); REV=Math.max(REV,appliedRev);
           s('cloud_rev',String(REV)); rerender(); if(!silent)wxToast&&wxToast('Pulled latest ✓'); else wxToast&&wxToast('Synced from cloud'); }
@@ -3212,17 +3297,17 @@ openSyncModal=function(){
     try{
       let attempts=0;
       while(true){
-        let remote=null; try{ remote=await provider().get(); }catch(e){ remote=null; }
+        let remote=null; try{ remote=await readRemote(); }catch(e){ remote=null; }
         if(remote&&remote.sig===SIG&&(+remote.rev||0)>baseRev){ mergeIn(remote); baseRev=+remote.rev||0; appliedRev=Math.max(appliedRev,baseRev); }
         REV=Math.max(REV,baseRev)+1;
-        try{ await provider().put(buildDoc(REV)); }
+        try{ await writeRemote(buildDoc(REV)); }
         catch(err){ if(err&&err.conflict&&attempts<5){ setStatus('conflict');   // server-enforced CAS rejected us
-            let cur=null; try{ cur=await provider().get(); }catch(e){}
+            let cur=null; try{ cur=await readRemote(); }catch(e){}
             if(cur&&cur.sig===SIG){ mergeIn(cur); baseRev=+cur.rev||baseRev; appliedRev=Math.max(appliedRev,baseRev); }
             attempts++; continue; }
           throw err; }
         /* verify our write landed and wasn't overwritten by a concurrent writer */
-        let check=null; try{ check=await provider().get(); }catch(e){ check=null; }
+        let check=null; try{ check=await readRemote(); }catch(e){ check=null; }
         const landed = check && check.sig===SIG && (+check.rev||0)>=REV && dirtySatisfied(check);
         if(landed || attempts>=5){
           baseRev=+((check&&check.rev)||REV); appliedRev=baseRev; REV=Math.max(REV,baseRev); s('cloud_rev',String(REV));
@@ -3253,9 +3338,12 @@ openSyncModal=function(){
     }catch(e){}
   }
 
-  /* ---- polling ---- */
-  function startPoll(){ stopPoll(); if(!configured())return; pollTimer=setInterval(()=>{ if(document.visibilityState!=='hidden')pull(true); }, cfg().poll*1000); }
+  /* ---- polling (fallback for JSONBin / REST) ---- */
+  function startPoll(){ stopPoll(); if(!configured()||cfg().provider==='supabase')return; pollTimer=setInterval(()=>{ if(document.visibilityState!=='hidden')pull(true); }, cfg().poll*1000); }
   function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+  /* start the right sync mechanism based on provider */
+  function startSync(){ if(cfg().provider==='supabase')startRealtime(); else startPoll(); }
+  function stopSync(){ stopRealtime(); stopPoll(); }
 
   /* ---- status chip (reuses the header State dot) ---- */
   let STATUS='idle';
@@ -3275,19 +3363,34 @@ openSyncModal=function(){
   /* ---- settings modal ---- */
   function openCloudModal(){
     const c=cfg();
-    document.getElementById('modalBody').innerHTML=`<h2>Multi-user cloud sync — shared source of truth</h2>
-      <div style="color:var(--ink2);font-size:12px;margin:4px 0 12px;line-height:1.5">Point every user (and Power BI) at ONE shared cloud document.
-        Contracts, weekly execution, comments and history then live centrally and sync to all 15+ users. Your own tab, project and filters stay personal to your screen.</div>
+    document.getElementById('modalBody').innerHTML=`<h2>Multi-user cloud sync</h2>
+      <div style="color:var(--ink2);font-size:12px;margin:4px 0 12px;line-height:1.5">One shared backend → all users see the same data instantly. <b>Supabase</b> is recommended: free, unlimited size, real-time updates (no polling needed), works from Power BI.</div>
       <div class="syncField"><label>Provider</label>
         <select id="clProv" style="width:100%">
           <option value="" ${!c.provider?'selected':''}>Off (local only)</option>
-          <option value="jsonbin" ${c.provider==='jsonbin'?'selected':''}>JSONBin.io (recommended — free, CORS, works in Power BI)</option>
-          <option value="rest" ${c.provider==='rest'?'selected':''}>Custom REST / your backend (GET+PUT one JSON doc)</option>
+          <option value="supabase" ${c.provider==='supabase'?'selected':''}>⭐ Supabase (recommended — free, real-time, no size limit)</option>
+          <option value="jsonbin" ${c.provider==='jsonbin'?'selected':''}>JSONBin.io (100 KB free limit)</option>
+          <option value="rest" ${c.provider==='rest'?'selected':''}>Custom REST backend</option>
         </select></div>
-      <div class="syncField"><label>Bin ID or full URL</label>
-        <input type="text" id="clBin" placeholder="e.g. 66f… or https://api.jsonbin.io/v3/b/66f…" value="${(c.bin||'').replace(/"/g,'&quot;')}"></div>
-      <div class="syncField"><label>Key (JSONBin: X-Master-Key · REST: Bearer token)</label>
-        <input type="text" id="clKey" placeholder="access key" value="${(c.key||'').replace(/"/g,'&quot;')}"></div>
+      <div id="clSupaHelp" style="display:${c.provider==='supabase'||!c.provider?'block':'none'}">
+        <div class="syncNote" style="margin-bottom:8px"><b>Supabase setup (one time, ~2 min):</b><br>
+          1. من <b>Supabase dashboard</b> اختر مشروعك → <b>Table Editor → New table</b> اسمه <code>dashboard_state</code><br>
+          أو افتح <b>SQL Editor</b> والصق هذا الكود:<br>
+          <code style="display:block;margin:6px 0;padding:6px 8px;background:var(--surface2);border-radius:6px;font-size:10px;line-height:1.6">create table if not exists dashboard_state (
+  id integer primary key default 1,
+  payload text,
+  updated_at timestamptz default now()
+);
+-- allow anonymous read/write (or use anon key + RLS)
+alter table dashboard_state enable row level security;
+create policy "allow all" on dashboard_state for all using (true) with check (true);</code>
+          2. من <b>Project Settings → API</b>: انسخ <b>Project URL</b> و <b>anon public key</b><br>
+          3. الصقهم في الحقلين التاليين واضغط <b>Save & connect</b></div>
+      </div>
+      <div class="syncField"><label id="clBinLbl">Project URL / Bin ID / Endpoint</label>
+        <input type="text" id="clBin" placeholder="https://xxxx.supabase.co  أو  Bin ID  أو  REST URL" value="${(c.bin||'').replace(/"/g,'&quot;')}"></div>
+      <div class="syncField"><label id="clKeyLbl">API Key (anon key للـ Supabase · X-Master-Key للـ JSONBin · Bearer token للـ REST)</label>
+        <input type="text" id="clKey" placeholder="anon / service_role key" value="${(c.key||'').replace(/"/g,'&quot;')}"></div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <div class="syncField" style="flex:1"><label>Your name (for audit + updated_by)</label>
           <input type="text" id="clUser" placeholder="e.g. Ahmed" value="${(c.user||'').replace(/"/g,'&quot;')}"></div>
@@ -3298,37 +3401,43 @@ openSyncModal=function(){
         <input type="checkbox" id="clAuto" ${c.auto?'checked':''}> Auto: pull on open + poll, push after every change</label>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <button class="ebtn save" id="clSave">Save & connect</button>
+        <button class="wkbtn" id="clSetup" style="display:${c.provider==='supabase'?'inline-flex':'none'}">Create table (SQL)</button>
         <button class="wkbtn" id="clTest">Test connection</button>
-        <button class="wkbtn" id="clCreate">Create new JSONBin</button>
+        <button class="wkbtn" id="clCreate" style="display:${c.provider==='jsonbin'?'inline-flex':'none'}">Create new JSONBin</button>
         <button class="wkbtn" id="clPull">⭳ Sync now (pull)</button>
         <button class="wkbtn" id="clPush">⭱ Push now</button>
         <span id="clStat" class="syncPill">${configured()?'configured':'off'}</span>
       </div>
       <div id="clLive" style="margin-top:10px;font-size:11.5px;color:var(--ink2);background:var(--surface2);border-radius:8px;padding:8px 11px"></div>
-      <div class="syncNote"><b>2-minute setup:</b> sign up free at <code>jsonbin.io</code>, open <b>API Keys</b> and copy your <b>X-Master-Key</b>,
-        paste it above, then click <b>Create new JSONBin</b> (or paste an existing Bin ID). Share the same Bin ID + key with all users.<br>
+      <div class="syncNote"><b>Supabase:</b> مجاني وغير محدود الحجم — انشئ الجدول بزر <b>Create table (SQL)</b> وشارك نفس الـURL والـanon key مع كل المستخدمين. البيانات تتزامن فوريًا عبر WebSocket.<br><b>JSONBin:</b> 
         <b>Security:</b> a JSONBin Master Key in a public GitHub Pages file is fine for a prototype but is <i>visible to anyone</i>. For production, switch Provider to <b>Custom REST</b> pointing at your own API (auth + database + server-enforced compare-and-swap) — no dashboard rewrite needed.<br>
-        <b>Power BI:</b> the workspace iframe blocks browser storage, so this cloud doc is what makes data (and your last view) survive refresh, iframe recreation and reopen.<br>
+        <b>Size:</b> the shared doc is gzip-compressed (≈20–30&nbsp;KB), so it fits JSONBin's free 100&nbsp;KB limit with room to spare — click <b>Create new JSONBin</b> from here rather than pasting the raw JSON, which is uncompressed.<br><b>Power BI:</b> the workspace iframe blocks browser storage, so this cloud doc is what makes data (and your last view) survive refresh, iframe recreation and reopen.<br>
         <b>Conflicts:</b> different records edited at once all survive; comments &amp; history are never lost; same-record simultaneous edits keep newest by <code>updated_at</code> (JSONBin) or are rejected+retried via compare-and-swap (Custom REST).</div>
       <div id="clAudit" style="margin-top:10px"></div>`;
     const q=id=>document.getElementById(id);
+    setTimeout(()=>{ const pEl=q('clProv'); if(pEl)pEl.onchange=()=>{ const v=pEl.value; const sh=q('clSupaHelp'); const sb=q('clSetup'); const cb=q('clCreate'); if(sh)sh.style.display=v==='supabase'?'block':'none'; if(sb)sb.style.display=v==='supabase'?'inline-flex':'none'; if(cb)cb.style.display=v==='jsonbin'?'inline-flex':'none'; }; },0);
     const readForm=()=>{ s('cloud_provider',q('clProv').value); s('cloud_bin',q('clBin').value.trim());
       s('cloud_key',q('clKey').value.trim()); s('wx_user',q('clUser').value.trim()); s('cloud_poll',String(+q('clPoll').value||10));
       s('cloud_auto',q('clAuto').checked?'1':'0'); };
     q('clSave').onclick=async()=>{ readForm(); q('clStat').textContent=configured()?'connecting…':'off';
-      if(configured()){ await pull(false); restoreMyUI(); startPoll(); q('clStat').textContent='live · r'+REV; renderAudit(); } updateModalStatus(); };
-    q('clTest').onclick=async()=>{ readForm(); if(!configured()){ q('clStat').textContent='set provider + bin first'; return; }
-      q('clStat').textContent='testing…'; try{ const d=await provider().get();
-        q('clStat').textContent=(d&&d.sig===SIG)?('OK — found rev '+(d.rev||0)):'reachable, but empty/new bin'; }
+      if(configured()){ await pull(false); restoreMyUI(); stopSync(); startSync(); q('clStat').textContent='live · r'+REV; renderAudit(); } updateModalStatus(); };
+    /* Supabase setup: open SQL editor for the project */
+    const suSetup=q('clSetup'); if(suSetup) suSetup.onclick=()=>{ readForm(); const url=(q('clBin')||{value:''}).value.trim();
+      const ref=url.replace('https://','').replace('http://','').split('.')[0];
+      window.open('https://supabase.com/dashboard/project/'+ref+'/sql/new','_blank');
+      wxToast&&wxToast('SQL Editor فتح في تاب جديد — الصق الـSQL واضغط Run ثم ارجع وضغط Test connection'); };
+    q('clTest').onclick=async()=>{ readForm(); if(!configured()){ q('clStat').textContent='set provider + credentials first'; return; }
+      q('clStat').textContent='testing…'; try{ const d=await readRemote();
+        q('clStat').textContent=(d&&d.sig===SIG)?('OK — rev '+(d.rev||0)):(!d?'connected — table empty (first run, push to init)':'connected, different data'); }
       catch(e){ q('clStat').textContent='FAILED: '+e.message; } };
     q('clCreate').onclick=async()=>{ readForm(); const key=q('clKey').value.trim();
       if(!key){ alert('Enter your JSONBin X-Master-Key first.'); return; }
-      try{ const r=await F('https://api.jsonbin.io/v3/b',{method:'POST',
+      try{ const wire=await encodeWire(buildDoc(1)); const r=await F('https://api.jsonbin.io/v3/b',{method:'POST',
           headers:{'Content-Type':'application/json','X-Master-Key':key,'X-Bin-Name':'RUA Dashboard State','X-Bin-Private':'true'},
-          body:JSON.stringify(buildDoc(1))});
+          body:JSON.stringify(wire)});
         const j=await r.json(); const id=j&&j.metadata&&j.metadata.id;
         if(id){ q('clBin').value=id; s('cloud_bin',id); s('cloud_provider','jsonbin'); q('clProv').value='jsonbin';
-          baseRev=appliedRev=REV=1; s('cloud_rev','1'); q('clStat').textContent='created · '+id; startPoll(); wxToast&&wxToast('Cloud bin created ✓'); }
+          baseRev=appliedRev=REV=1; s('cloud_rev','1'); q('clStat').textContent='created · '+id; stopSync(); startSync(); wxToast&&wxToast('Cloud bin created ✓'); }
         else alert('Bin created but no id returned — check the key/response.');
       }catch(e){ alert('Create failed: '+e.message+'\n(If this runs inside Power BI, the request still uses your browser — the key must be a valid JSONBin Master Key.)'); }
       updateModalStatus(); };
@@ -3361,7 +3470,7 @@ openSyncModal=function(){
   document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden'&&pending&&configured())push('hide'); });
 
   /* ---- expose (tests + spec-named aliases) ---- */
-  window.CloudSync={ pull, push, mergeIn, buildDoc, cfg, configured, startPoll, stopPoll, restoreMyUI, applyUI, uiSnapshot, currentUser,
+  window.CloudSync={ pull, push, mergeIn, buildDoc, cfg, configured, startPoll, stopPoll, startSync, stopSync, startRealtime, stopRealtime, restoreMyUI, applyUI, uiSnapshot, currentUser,
     addAudit, stampAll:()=>window.cloudStampAll(), status:()=>({rev:REV,appliedRev,baseRev,pending,status:STATUS,lastSyncAt,audit:AUDIT.length,dirty:[...dirtyIds],uiUsers:Object.keys(UIBYUSER).length}),
     _setRev:v=>{REV=baseRev=appliedRev=v;} };
   /* spec-named modular API */
@@ -3369,7 +3478,7 @@ openSyncModal=function(){
   window.mergeStates=mergeIn; window.restoreDashboardState=restoreMyUI; window.startPolling=startPoll; window.flushOfflineQueue=()=>{ if(pending)return push('flush'); };
 
   /* ---- boot: config -> pull shared state -> restore THIS user's view -> render -> poll ---- */
-  if(configured()){ pull(true).then(()=>{ restoreMyUI(); startPoll(); }); }
+  if(configured()){ pull(true).then(()=>{ restoreMyUI(); startSync(); }); }
 })();
 </script>
 
